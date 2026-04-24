@@ -137,6 +137,12 @@ function createSessionToken(): string {
 // ── Default admin creation ─────────────────────────────────────────
 
 export async function ensureDefaultAdmin(): Promise<void> {
+  // Only create default admin if authentication is enabled
+  if (!env.AUTH_ENABLED) {
+    console.log("Authentication is disabled, skipping default admin creation.");
+    return;
+  }
+
   const existingUsers = db.select().from(schema.users).all();
   if (existingUsers.length > 0) return;
 
@@ -290,28 +296,103 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       if (session) {
         db.delete(schema.sessions).where(eq(schema.sessions.id, token)).run();
       }
+
+      // Try API key authentication if token has si_ prefix
+      if (token.startsWith("si_")) {
+        const prefix = computeKeyPrefix(token);
+        // Lookup by prefix (O(1) instead of scanning all keys)
+        const candidates = db
+          .select()
+          .from(schema.apiKeys)
+          .where(eq(schema.apiKeys.keyPrefix, prefix))
+          .all();
+        // Fall back to full scan for legacy keys without a prefix
+        const keysToCheck =
+          candidates.length > 0
+            ? candidates
+            : db
+                .select()
+                .from(schema.apiKeys)
+                .all()
+                .filter((k) => !k.keyPrefix);
+        for (const key of keysToCheck) {
+          const matches = await verifyPassword(token, key.keyHash);
+          if (matches) {
+            // Check expiration
+            if (key.expiresAt && key.expiresAt < new Date()) {
+              // Key expired — skip it
+              continue;
+            }
+            // Backfill prefix for legacy keys
+            if (!key.keyPrefix) {
+              db.update(schema.apiKeys)
+                .set({ keyPrefix: prefix, lastUsedAt: new Date() })
+                .where(eq(schema.apiKeys.id, key.id))
+                .run();
+            } else {
+              db.update(schema.apiKeys)
+                .set({ lastUsedAt: new Date() })
+                .where(eq(schema.apiKeys.id, key.id))
+                .run();
+            }
+            // Load the user
+            const apiUser = db
+              .select()
+              .from(schema.users)
+              .where(eq(schema.users.id, key.userId))
+              .get();
+            if (apiUser) {
+              const keyPermissions = key.permissions
+                ? JSON.parse(key.permissions as string)
+                : undefined;
+              (request as FastifyRequest & { user?: AuthUser }).user = {
+                id: apiUser.id,
+                username: apiUser.username,
+                role: apiUser.role,
+                apiKeyPermissions: keyPermissions,
+              };
+              return;
+            }
+          }
+        }
+      }
+
+      // Public routes can proceed without a valid session
+      if (isPublic) return;
       return reply.status(401).send({ error: "Session expired or invalid" });
     }
 
     const user = db.select().from(schema.users).where(eq(schema.users.id, session.userId)).get();
 
     if (!user) {
+      if (isPublic) return;
       return reply.status(401).send({ error: "User not found" });
     }
 
-    return reply.send({
-      user: {
-        id: user.id,
-        username: user.username,
-        role: user.role,
-        mustChangePassword: env.SKIP_MUST_CHANGE_PASSWORD ? false : user.mustChangePassword,
-        permissions: getPermissions(user.role),
-        analyticsEnabled: user.analyticsEnabled ?? null,
-        analyticsConsentShownAt: user.analyticsConsentShownAt?.getTime() ?? null,
-        analyticsConsentRemindAt: user.analyticsConsentRemindAt?.getTime() ?? null,
-      },
-      expiresAt: session.expiresAt.toISOString(),
-    });
+    // Attach user info to request for downstream handlers
+    // (always populate when a valid session exists, even on public routes)
+    (request as FastifyRequest & { user?: AuthUser }).user = {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+    };
+
+    // Enforce mustChangePassword — block non-auth API calls
+    // (skipped when SKIP_MUST_CHANGE_PASSWORD=true for CI/dev environments)
+    if (user.mustChangePassword && !env.SKIP_MUST_CHANGE_PASSWORD) {
+      const allowed = [
+        "/api/auth/change-password",
+        "/api/auth/logout",
+        "/api/auth/session",
+        "/api/v1/config/",
+      ];
+      if (!allowed.some((p) => request.url.startsWith(p)) && request.url.startsWith("/api/")) {
+        return reply.status(403).send({
+          error: "Password change required",
+          code: "MUST_CHANGE_PASSWORD",
+        });
+      }
+    }
   });
 
   // POST /api/auth/change-password
@@ -838,7 +919,7 @@ export async function authMiddleware(app: FastifyInstance): Promise<void> {
                 .run();
             } else {
               db.update(schema.apiKeys)
-                .set({ lastUsedAt: new Date() })
+                .set({ lastUsedAt: new Date() })/
                 .where(eq(schema.apiKeys.id, key.id))
                 .run();
             }
